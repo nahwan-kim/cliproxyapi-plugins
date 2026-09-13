@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
-	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"github.com/tidwall/gjson"
@@ -12,29 +11,10 @@ import (
 	sdkv1 "github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal/sdk/v1"
 )
 
-// discoveredCatalog remembers the last successful per-credential discovery so that static
-// registration, which runs without a credential, can still describe the provider.
-var discoveredCatalog atomic.Value
-
-// staticModels advertises the provider before any credential is consulted. The executor is
-// bound to its provider through the executor identifier rather than this list, so an empty
-// response only leaves the provider without registered models until the first per-credential
-// discovery succeeds. Cursor's catalog is never hard-coded here.
-func staticModels(raw []byte) ([]byte, error) {
-	var req pluginapi.StaticModelRequest
-	if len(raw) > 0 {
-		if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-			return nil, errUnmarshal
-		}
-	}
-	var models []pluginapi.ModelInfo
-	if cached, ok := discoveredCatalog.Load().([]pluginapi.ModelInfo); ok {
-		models = cached
-	}
-	return okEnvelope(pluginapi.ModelResponse{
-		Provider: providerIdentifier,
-		Models:   applyExcludedModels(models, excludedModelsForRequest(req.Host, nil, nil)),
-	})
+// staticModels identifies the provider without publishing credential-derived models. Each
+// account's catalog is registered from modelsForAuth so the host can apply that auth's prefix.
+func staticModels(_ []byte) ([]byte, error) {
+	return okEnvelope(pluginapi.ModelResponse{Provider: providerIdentifier})
 }
 
 // modelsForAuth discovers the catalog visible to one credential. Which models a key can
@@ -63,7 +43,6 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 			"reason":  reason,
 		})
 	} else {
-		discoveredCatalog.Store(models)
 		hostLog("debug", "cursor model discovery succeeded", map[string]any{
 			"auth_id": req.AuthID,
 			"models":  len(models),

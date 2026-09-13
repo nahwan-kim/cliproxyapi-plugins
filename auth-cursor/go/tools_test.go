@@ -278,6 +278,9 @@ func TestExecuteToolCallRoundTrip(t *testing.T) {
 	if got := bridge.deletedAgents(); len(got) != 0 {
 		t.Fatalf("deleted agents = %v, want none while the callback is parked", got)
 	}
+	if got := bridge.cancelledRuns(); len(got) != 0 {
+		t.Fatalf("cancelled runs = %v, want none while the tool-call response is successfully parked", got)
+	}
 	waitUntil(t, func() bool { return bridge.inflightToolCalls() == 1 })
 
 	second := decodeCompletion(t, mustExecute(t, "good-key", map[string]any{
@@ -334,6 +337,9 @@ func TestRunGenerateStreamsTextThenToolCallsThenContinuation(t *testing.T) {
 	if first.text != "Looking " || len(first.toolCalls) != 1 {
 		t.Fatalf("first result = %+v", first)
 	}
+	if got := bridge.cancelledRuns(); len(got) != 0 {
+		t.Fatalf("cancelled runs = %v, want none after a successful parked streaming turn", got)
+	}
 
 	firstCount := len(firstDeltas)
 	var secondDeltas []string
@@ -355,6 +361,32 @@ func TestRunGenerateStreamsTextThenToolCallsThenContinuation(t *testing.T) {
 		t.Fatalf("continuation = %+v", second)
 	}
 	_ = bridge
+}
+
+func TestForwardStreamFailedToolCallHandoffAbortsRun(t *testing.T) {
+	bridge := useFakeBridge(t)
+	bridge.toolRounds = []fakeToolRound{{
+		Calls: []fakeToolCall{{Name: "get_weather", Args: map[string]any{"city": "Paris"}}},
+	}}
+	ctx := context.Background()
+	logCtx := newRequestLogContext(ctx, pluginapi.ExecutorRequest{}, "fake-model")
+	errForward := forwardStream(ctx, "unregistered-stream", "fake-model", framingRaw,
+		toolGenerateRequest(t, "good-key", "weather?"), &logCtx)
+	if errForward == nil {
+		t.Fatal("expected host stream emission to fail")
+	}
+	if got := bridge.cancelledRuns(); len(got) != 1 || got[0] != "run-1" {
+		t.Fatalf("cancelled runs = %v, want [run-1]", got)
+	}
+	if got := bridge.closedAgents(); len(got) != 1 || got[0] != "agent-1" {
+		t.Fatalf("closed agents = %v, want [agent-1]", got)
+	}
+	if got := bridge.deletedAgents(); len(got) != 1 || got[0] != "agent-1" {
+		t.Fatalf("deleted agents = %v, want [agent-1]", got)
+	}
+	if !toolRegistryEmpty() {
+		t.Fatal("tool registry still holds the failed handoff")
+	}
 }
 
 func TestOverlappingToolCallsBatchAndLateCallbackIsNextTurn(t *testing.T) {

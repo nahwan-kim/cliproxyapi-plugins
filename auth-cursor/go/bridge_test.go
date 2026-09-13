@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -21,7 +22,73 @@ import (
 	"connectrpc.com/connect"
 
 	sdkv1 "github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal/sdk/v1"
+	"github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal/sdk/v1/sdkv1connect"
 )
+
+type truncatedStreamFakeBridge struct {
+	*fakeBridge
+	broken bool
+}
+
+func (f *truncatedStreamFakeBridge) Send(_ context.Context, req *connect.Request[sdkv1.SendRequest], stream *connect.ServerStream[sdkv1.RunStreamMessage]) error {
+	agentID := req.Msg.GetAgentId()
+	if errSend := stream.Send(&sdkv1.RunStreamMessage{
+		Envelope: &sdkv1.RunStreamMessage_SdkMessage{SdkMessage: &sdkv1.SdkMessage{
+			Type:    "system",
+			Message: mustStruct(map[string]any{"subtype": "init", "run_id": "run-1", "agent_id": agentID}),
+		}},
+	}); errSend != nil {
+		return errSend
+	}
+	if f.broken {
+		return connect.NewError(connect.CodeUnavailable, errors.New("fake broken run stream"))
+	}
+	return nil
+}
+
+func useTruncatedStreamFakeBridge(t *testing.T, broken bool) *fakeBridge {
+	t.Helper()
+	bridge := newFakeBridge()
+	handler := &truncatedStreamFakeBridge{fakeBridge: bridge, broken: broken}
+	mux := http.NewServeMux()
+	options := connect.WithHandlerOptions(connect.WithInterceptors(requireFakeBridgeToken{}))
+	mux.Handle(sdkv1connect.NewSdkAgentServiceHandler(handler, options))
+	mux.Handle(sdkv1connect.NewSdkCursorServiceHandler(handler, options))
+	mux.Handle(sdkv1connect.NewSdkBridgeControlServiceHandler(handler, options))
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	process := &bridgeProcess{
+		workspace: t.TempDir(),
+		stderr:    &tailBuffer{},
+		exited:    make(chan struct{}),
+	}
+	if errBind := process.bindClients(bridgeDiscovery{
+		SchemaVersion: bridgeDiscoverySchema,
+		Transport:     "tcp",
+		Protocol:      "connect",
+		URL:           server.URL,
+		AuthToken:     fakeBridgeToken,
+	}); errBind != nil {
+		t.Fatalf("bind truncated fake bridge clients: %v", errBind)
+	}
+
+	bridgePool.mu.Lock()
+	previous := bridgePool.procs
+	bridgePool.procs = map[string]*bridgeProcess{"": process}
+	bridgePool.mu.Unlock()
+	currentConfig.Store(defaultPluginConfig())
+	resetModelCatalogs()
+	t.Cleanup(func() {
+		evictSessionsForProcess(process)
+		bridgePool.mu.Lock()
+		bridgePool.procs = previous
+		bridgePool.mu.Unlock()
+		currentConfig.Store(defaultPluginConfig())
+		resetModelCatalogs()
+	})
+	return bridge
+}
 
 // useTempCacheDir redirects the user cache directory, which is where the bridge tree and its
 // durable state live, so a test never touches the operator's own installation.
@@ -742,5 +809,46 @@ func TestBridgeStateRootIsVersionedAndOutsideTheAuthDirectory(t *testing.T) {
 	}
 	if !strings.HasPrefix(root, cache) {
 		t.Errorf("state root = %q, want it under the cache directory %q", root, cache)
+	}
+}
+
+func TestRunGenerateCancelsAndTearsDownBrokenStream(t *testing.T) {
+	bridge := useTruncatedStreamFakeBridge(t, true)
+	_, errRun := runGenerate(context.Background(), generateRequest{
+		apiKey:      "good-key",
+		model:       "fake-model",
+		optimizeFor: defaultOptimizeFor,
+		prompt:      "hi",
+	}, nil)
+	if errRun == nil {
+		t.Fatal("expected broken stream error")
+	}
+	assertAbandonedRunCleanup(t, bridge)
+}
+
+func TestRunGenerateCancelsAndTearsDownCleanTruncatedStream(t *testing.T) {
+	bridge := useTruncatedStreamFakeBridge(t, false)
+	_, errRun := runGenerate(context.Background(), generateRequest{
+		apiKey:      "good-key",
+		model:       "fake-model",
+		optimizeFor: defaultOptimizeFor,
+		prompt:      "hi",
+	}, nil)
+	if errRun == nil || !strings.Contains(errRun.Error(), "closed the run stream before it completed") {
+		t.Fatalf("error = %v, want clean truncated stream error", errRun)
+	}
+	assertAbandonedRunCleanup(t, bridge)
+}
+
+func assertAbandonedRunCleanup(t *testing.T, bridge *fakeBridge) {
+	t.Helper()
+	if got := bridge.cancelledRuns(); len(got) != 1 || got[0] != "run-1" {
+		t.Fatalf("cancelled runs = %v, want [run-1]", got)
+	}
+	if got := bridge.closedAgents(); len(got) != 1 || got[0] != "agent-1" {
+		t.Fatalf("closed agents = %v, want [agent-1]", got)
+	}
+	if got := bridge.deletedAgents(); len(got) != 1 || got[0] != "agent-1" {
+		t.Fatalf("deleted agents = %v, want [agent-1]", got)
 	}
 }

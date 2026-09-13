@@ -798,33 +798,39 @@ func TestModelsForAuthPrefersMergedAttributeExclusions(t *testing.T) {
 	modelByID(t, response.Models, "auto-smart")
 }
 
-func TestStaticModelsHidesHostExcludedDefault(t *testing.T) {
+func TestStaticModelsDoNotLeakPrefixedAuthCatalog(t *testing.T) {
 	useFakeBridge(t)
 
-	_, errModels := modelsForAuth(mustJSON(t, pluginapi.AuthModelRequest{
+	rawAuth, errModels := modelsForAuth(mustJSON(t, pluginapi.AuthModelRequest{
 		AuthID:      "cursor-dev.json",
-		StorageJSON: storageJSON("good-key"),
+		StorageJSON: []byte(`{"type":"cursor","api_key":"good-key","prefix":"cursor"}`),
 	}))
 	if errModels != nil {
 		t.Fatalf("modelsForAuth: %v", errModels)
 	}
+	var authResponse pluginapi.ModelResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, rawAuth).Result, &authResponse); errUnmarshal != nil {
+		t.Fatalf("decode per-auth models: %v", errUnmarshal)
+	}
+	if len(authResponse.Models) != 3 {
+		t.Fatalf("per-auth models = %+v, want the three catalog entries", authResponse.Models)
+	}
+	modelByID(t, authResponse.Models, "fake-model")
 
-	raw, errStatic := staticModels(mustJSON(t, pluginapi.StaticModelRequest{
-		Host: pluginapi.HostConfigSummary{
-			ExcludedModels: map[string][]string{
-				"cursor": {"default"},
-			},
-		},
-	}))
+	rawStatic, errStatic := staticModels(mustJSON(t, pluginapi.StaticModelRequest{}))
 	if errStatic != nil {
 		t.Fatalf("staticModels: %v", errStatic)
 	}
-	var response pluginapi.ModelResponse
-	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
-		t.Fatalf("decode models: %v", errUnmarshal)
+	var staticResponse pluginapi.ModelResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, rawStatic).Result, &staticResponse); errUnmarshal != nil {
+		t.Fatalf("decode static models: %v", errUnmarshal)
 	}
-	assertHiddenModel(t, response.Models, "default")
-	modelByID(t, response.Models, "fake-model")
+	if staticResponse.Provider != providerIdentifier {
+		t.Errorf("static provider = %q, want %q", staticResponse.Provider, providerIdentifier)
+	}
+	if len(staticResponse.Models) != 0 {
+		t.Errorf("static models = %+v, want none", staticResponse.Models)
+	}
 }
 
 func modelByID(t *testing.T, models []pluginapi.ModelInfo, id string) pluginapi.ModelInfo {

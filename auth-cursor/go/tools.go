@@ -550,6 +550,23 @@ func (r *toolRun) unregister() {
 	toolRegistry.mu.Unlock()
 }
 
+func abortToolCallHandoff(calls []chatToolCall, err error) bool {
+	var run *toolRun
+	toolRegistry.mu.Lock()
+	for _, call := range calls {
+		if candidate := toolRegistry.byExposedCallID[strings.TrimSpace(call.ID)]; candidate != nil {
+			run = candidate
+			break
+		}
+	}
+	toolRegistry.mu.Unlock()
+	if run == nil {
+		return false
+	}
+	run.abort(err)
+	return true
+}
+
 func abortParkedToolRuns(err error) {
 	if err == nil {
 		err = errors.New("tool run aborted")

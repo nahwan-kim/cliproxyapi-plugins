@@ -55,14 +55,25 @@ func execute(raw []byte) ([]byte, error) {
 		payload, errBody = buildCompletion(newCompletionID(), model, result.text, result.usage)
 	}
 	if errBody != nil {
+		if len(result.toolCalls) > 0 {
+			abortToolCallHandoff(result.toolCalls, errBody)
+		}
 		logCtx.failed(errBody.Error())
 		return errorEnvelope("executor_error", errBody.Error()), nil
 	}
-	logCtx.completed(result.usage)
-	return okEnvelope(pluginapi.ExecutorResponse{
+	response, errResponse := okEnvelope(pluginapi.ExecutorResponse{
 		Payload: payload,
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
 	})
+	if errResponse != nil {
+		if len(result.toolCalls) > 0 {
+			abortToolCallHandoff(result.toolCalls, errResponse)
+		}
+		logCtx.failed(errResponse.Error())
+		return nil, errResponse
+	}
+	logCtx.completed(result.usage)
+	return response, nil
 }
 
 // executeStream hands the response back through the host stream bridge: the RPC returns as
@@ -138,6 +149,7 @@ func forwardStream(ctx context.Context, streamID, model string, framing streamFr
 	}
 	if len(result.toolCalls) > 0 {
 		if errEmit := emitToolCallStream(streamID, completionID, model, framing, result.toolCalls, &roleSent); errEmit != nil {
+			abortToolCallHandoff(result.toolCalls, errEmit)
 			logCtx.failed(errEmit.Error())
 			return errEmit
 		}

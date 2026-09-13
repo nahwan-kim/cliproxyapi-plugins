@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -610,7 +609,6 @@ func resetModelCatalogs() {
 		modelCatalogs.Delete(key)
 		return true
 	})
-	discoveredCatalog.Store([]pluginapi.ModelInfo(nil))
 }
 
 func storageJSON(apiKey string) []byte {

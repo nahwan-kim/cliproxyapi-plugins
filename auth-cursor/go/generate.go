@@ -225,9 +225,8 @@ func isAgentNotFound(err error) bool {
 // consumeRunStream reads a Send stream to its terminal result.
 //
 // Every path that leaves without a terminal result cancels the run first, because losing the
-// stream does not stop it: the bridge keeps it executing and Cursor keeps billing it. The
-// cancellation is issued here rather than from a watcher goroutine so that it reaches the
-// bridge before the agent teardown that follows this call.
+// stream does not stop it. The cancellation is issued here rather than from a watcher goroutine
+// so that it reaches the bridge before the agent teardown that follows this call.
 func consumeRunStream(
 	process *bridgeProcess,
 	agentID string,
@@ -282,6 +281,7 @@ func consumeRunStream(
 		return generateResult{}, errStream
 	}
 	if result == nil {
+		cancelRun(process, agentID, runID)
 		return generateResult{}, errors.New("cursor sdk bridge closed the run stream before it completed")
 	}
 	if result.GetStatus() != sdkv1.RunLifecycleStatus_RUN_LIFECYCLE_STATUS_FINISHED {
@@ -358,14 +358,19 @@ func structString(value *structpb.Struct, field string) string {
 	return ""
 }
 
-// cancelRun stops a run nobody is going to read.
+// cancelRun asks the bridge to stop a run nobody is going to read.
 //
 // It is best effort and runs on its own context: the request context is usually what caused the
-// cancellation in the first place, and the request is over either way.
+// cancellation in the first place, and the request is over either way. An acknowledgement only
+// confirms that the bridge accepted the request; it does not prove upstream execution stopped.
 func cancelRun(process *bridgeProcess, agentID, runID string) {
 	if runID == "" {
 		// The run id arrives on the stream, so a run abandoned before its first message cannot
 		// be cancelled by id. The agent teardown that follows is the only stop signal left.
+		hostLog("warn", fmt.Sprintf("cursor run cancellation unavailable agent_id=%s run_id=missing", agentID), map[string]any{
+			"agent_id": agentID,
+			"outcome":  "run_id_unavailable",
+		})
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), agentCleanupTimeout)
@@ -374,25 +379,55 @@ func cancelRun(process *bridgeProcess, agentID, runID string) {
 		RunId:   runID,
 		AgentId: &agentID,
 	})); errCancel != nil {
-		hostLog("warn", "cursor run could not be cancelled", map[string]any{
-			"run_id": runID,
-			"error":  errCancel.Error(),
+		hostLog("warn", fmt.Sprintf("cursor run cancellation failed agent_id=%s run_id=%s", agentID, runID), map[string]any{
+			"agent_id": agentID,
+			"run_id":   runID,
+			"outcome":  "failed",
+			"error":    errCancel.Error(),
 		})
+		return
 	}
+	hostLog("info", fmt.Sprintf("cursor run cancellation acknowledged agent_id=%s run_id=%s", agentID, runID), map[string]any{
+		"agent_id": agentID,
+		"run_id":   runID,
+		"outcome":  "acknowledged",
+	})
 }
 
-// releaseAgent tears down a one-shot agent. Both calls are best effort: the request has already
-// been answered by the time they run, and a failure here must not change its outcome.
+// releaseAgent tears down an agent. Both calls are best effort: a cleanup failure must not change
+// the request outcome.
 func releaseAgent(process *bridgeProcess, agentID, apiKey string) {
 	ctx, cancel := context.WithTimeout(context.Background(), agentCleanupTimeout)
 	defer cancel()
 	if _, errClose := process.agent.CloseAgent(ctx, connect.NewRequest(&sdkv1.CloseAgentRequest{AgentId: agentID})); errClose != nil {
-		hostLog("debug", "cursor agent could not be closed", map[string]any{"error": errClose.Error()})
+		hostLog("warn", fmt.Sprintf("cursor agent close failed agent_id=%s", agentID), map[string]any{
+			"agent_id":  agentID,
+			"operation": "close",
+			"outcome":   "failed",
+			"error":     errClose.Error(),
+		})
+	} else {
+		hostLog("info", fmt.Sprintf("cursor agent close acknowledged agent_id=%s", agentID), map[string]any{
+			"agent_id":  agentID,
+			"operation": "close",
+			"outcome":   "acknowledged",
+		})
 	}
 	if _, errDelete := process.agent.DeleteAgent(ctx, connect.NewRequest(&sdkv1.DeleteAgentRequest{
 		AgentId: agentID,
 		Options: &sdkv1.AgentOperationOptions{Cwd: process.workspace, ApiKey: apiKey},
 	})); errDelete != nil {
-		hostLog("debug", "cursor agent state could not be deleted", map[string]any{"error": errDelete.Error()})
+		hostLog("warn", fmt.Sprintf("cursor agent delete failed agent_id=%s", agentID), map[string]any{
+			"agent_id":  agentID,
+			"operation": "delete",
+			"outcome":   "failed",
+			"error":     errDelete.Error(),
+		})
+	} else {
+		hostLog("info", fmt.Sprintf("cursor agent delete acknowledged agent_id=%s", agentID), map[string]any{
+			"agent_id":  agentID,
+			"operation": "delete",
+			"outcome":   "acknowledged",
+		})
 	}
 }
